@@ -9,9 +9,9 @@ import plotly.express as px
 from openai import OpenAI
 
 # ============ 配置区 ============
-API_KEY = "sk-ws-H.YYMYPYH.KDHn.MEYCIQCQqsGA9JFBl960EPQg8qLtorplbFLK4RsaKgRWBDF4pwIhAOmTxsSw66_s0_IX75Q16VgnGAL3vqFdmz1qFDVCldW6"
-BASE_URL = "https://maas.qianwenaiapi.com/compatible-mode/v1"
-MODEL_NAME = "qwen3.7-max"
+API_KEY = ""
+BASE_URL = ""
+MODEL_NAME = ""
 DB_PATH = "wrong_questions.db"
 
 st.set_page_config(page_title="AI课程笔记自测", page_icon="📝", layout="centered")
