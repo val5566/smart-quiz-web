@@ -9,9 +9,10 @@ import plotly.express as px
 from openai import OpenAI
 
 # ============ 配置区 ============
-API_KEY = ""
-BASE_URL = ""
-MODEL_NAME = ""
+# 请在这里填入你的真实 API Key（ms- 开头）
+API_KEY = "在这里填你真实的 ms- 开头Key"
+BASE_URL = "https://api-inference.modelscope.cn/v1"
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 DB_PATH = "wrong_questions.db"
 
 st.set_page_config(page_title="AI课程笔记自测", page_icon="📝", layout="centered")
