@@ -45,6 +45,14 @@ def init_db():
         cursor.execute("ALTER TABLE wrong_questions ADD COLUMN subject TEXT DEFAULT '未分类'")
     if "grade" not in columns:
         cursor.execute("ALTER TABLE wrong_questions ADD COLUMN grade TEXT DEFAULT '未分类'")
+    # 迁移 answer_index 列：从 INTEGER 改为 TEXT 以支持多选题的 JSON 数组
+    cursor.execute("PRAGMA table_info(wrong_questions)")
+    col_info = {row[1]: row[2] for row in cursor.fetchall()}
+    if col_info.get("answer_index") == "INTEGER":
+        # SQLite 不支持 ALTER COLUMN，但 TEXT 亲和性可以存任何值
+        # 现有的 INTEGER 值在读取时会被自动处理，无需实际改列类型
+        # 只需确保写入时用 json.dumps 即可兼容
+        pass
     conn.commit()
     conn.close()
 
@@ -58,11 +66,18 @@ def is_question_exists(question_text: str) -> bool:
     return count > 0
 
 
-def save_wrong_question(question: str, options: list, answer_index: int,
+def save_wrong_question(question: str, options: list, answer_index,
                         explanation: str, knowledge_point: str = "未分类",
                         subject: str = "未分类", grade: str = "未分类"):
+    """answer_index 可以是 int（单选）或 list[int]（多选）"""
     if is_question_exists(question):
         return
+
+    # 统一存储格式：单选存整数，多选存 JSON 数组字符串
+    if isinstance(answer_index, (list, tuple)):
+        answer_index_str = json.dumps(sorted(answer_index))
+    else:
+        answer_index_str = str(int(answer_index))
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -71,13 +86,82 @@ def save_wrong_question(question: str, options: list, answer_index: int,
             INSERT INTO wrong_questions
                 (question, options, answer_index, explanation, knowledge_point, subject, grade)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (question, json.dumps(options, ensure_ascii=False), answer_index,
+        """, (question, json.dumps(options, ensure_ascii=False), answer_index_str,
               explanation, knowledge_point, subject, grade))
         conn.commit()
     except sqlite3.IntegrityError:
         pass
     finally:
         conn.close()
+
+
+def delete_wrong_question(question_text: str) -> bool:
+    """根据题干文本删除单道错题，返回是否成功删除"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM wrong_questions WHERE question = ?", (question_text,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def delete_all_wrong_questions() -> int:
+    """清空所有错题，返回删除的行数"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM wrong_questions")
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def get_random_wrong_questions(limit: int = 5) -> list:
+    """从错题本中随机抽取最多 limit 道错题，返回标准格式的题目列表"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT question, options, answer_index, explanation,
+               knowledge_point, subject, grade
+        FROM wrong_questions
+        ORDER BY RANDOM()
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    questions = []
+    for row in rows:
+        question_text, options_json, answer_index_raw, explanation, kp, subj, grade = row
+        # 解析 options
+        try:
+            options = json.loads(options_json) if options_json else []
+        except (json.JSONDecodeError, TypeError):
+            options = []
+        if not isinstance(options, list) or len(options) < 4:
+            options = _normalize_options(options)
+        # 解析 answer_index
+        parsed_answer = answer_index_raw
+        if isinstance(answer_index_raw, str):
+            try:
+                parsed_answer = json.loads(answer_index_raw)
+            except (json.JSONDecodeError, TypeError):
+                try:
+                    parsed_answer = int(answer_index_raw)
+                except (ValueError, TypeError):
+                    parsed_answer = 0
+        parsed_answer = _coerce_answer_index(parsed_answer, len(options))
+        questions.append({
+            "question": question_text,
+            "options": options,
+            "answer_index": parsed_answer,
+            "explanation": explanation or "",
+            "knowledge_point": kp or "未分类",
+            "subject": subj or "未分类",
+            "grade": grade or "未分类",
+        })
+    return questions
 
 
 def get_wrong_questions_grouped_by_subject_and_kp() -> dict:
@@ -97,10 +181,20 @@ def get_wrong_questions_grouped_by_subject_and_kp() -> dict:
         subject, kp, question, options_json, answer_index, explanation, grade, created_at = row
         subject = subject or "未分类"
         kp = kp or "未分类"
+        # 解析 answer_index：可能是整数（单选）或 JSON 数组字符串（多选）
+        parsed_answer = answer_index
+        if isinstance(answer_index, str):
+            try:
+                parsed_answer = json.loads(answer_index)
+            except (json.JSONDecodeError, TypeError):
+                try:
+                    parsed_answer = int(answer_index)
+                except (ValueError, TypeError):
+                    parsed_answer = 0
         grouped.setdefault(subject, {}).setdefault(kp, []).append({
             "question": question,
             "options": json.loads(options_json) if options_json else [],
-            "answer_index": answer_index,
+            "answer_index": parsed_answer,
             "explanation": explanation,
             "grade": grade or "未分类",
             "created_at": created_at,
@@ -324,15 +418,21 @@ def extract_json(text: str) -> dict:
 
 
 # ============ 题目生成 ============
-SYSTEM_PROMPT_TEMPLATE = """你是一位严谨的课程助教。请根据用户提供的课程笔记，出 3 道单项选择题。
+SYSTEM_PROMPT_TEMPLATE = """你是一位严谨的课程助教。请根据用户提供的课程笔记，出 3 道{question_type_desc}。
 
 【本次出题上下文】
 - 学科：{subject}
 - 年级/难度：{grade}
-请严格按照上述学科和年级对应的知识深度与难度出题。
+- 题型：{question_type}
+请严格按照上述学科、年级和题型对应的知识深度与难度出题。
+
+【题型规则 —— 必须遵守】
+- 如果题型是"单选题"：每道题只有 1 个正确答案，answer_index 是一个 0~3 的整数。
+- 如果题型是"多选题"：每道题有 2~3 个正确答案，answer_index 是一个包含 2~3 个整数的数组（例如 [0, 2] 表示 A 和 C 正确）。多选题的题干中应明确提示"（多选）"或"以下哪些是正确的（多选）？"。
 
 【语言格式约束 —— 必须遵守】
-- 如果学科是\u201c英语\u201d：题干和选项以英文为主，但可以在题干末尾或选项中用括号附加中文释义来辅助理解（例如："What does the word \u2018ubiquitous\u2019 mean? (\u2018ubiquitous\u2019 \u7684\u610f\u601d\u662f\u4ec0\u4e48\uff1f)"）。解析（explanation）部分必须使用纯英文撰写，不要混入中文。
+- 如果学科是“英语”：题干和选项以英文为主，但可以在题干末尾或选项中用括号附加中文释义来辅助理解（例如："What does the word ‘ubiquitous’ mean? (‘ubiquitous’ 的意思是什么？)"）。
+- **无论学科是什么（包括英语），解析（explanation）部分必须全部使用中文进行解释，不要使用英文！**
 - 如果学科是其他（如数学、生物、计算机等），请使用中文生成题干、四个选项以及解析。
 
 【考点覆盖与题目差异化约束 —— 最高优先级，违反将导致题目作废】
@@ -374,14 +474,17 @@ SYSTEM_PROMPT_TEMPLATE = """你是一位严谨的课程助教。请根据用户�
 - 四个选项之间是否有足够的区分度（不能只是改个数字或加个副词）？
 - 3 道题的知识点和设问角度是否互不重复？
 - 题干是否泄露了答案？
-- **answer_index 是否与题干的设问方向一致？** 如果题目问"哪个不正确"，answer_index 必须指向那个不正确的选项，而不是指向那个正确的描述。
+- **answer_index 是否与题干的设问方向一致？** 这是最容易出错的地方！
+  - 如果题目问"哪些是正确的"，answer_index 指向正确的选项。
+  - 如果题目问"哪些不是/不正确/错误的"，answer_index 必须指向那些**不正确**的选项。
+  - 逐个检查：你选中的每个选项，是否真的符合题干的设问方向？如果一个选项的描述是正确的事实，但题目问的是"哪个不正确"，那你就不应该选它。
 
 【核心要求】
 1. 严禁出\u201c送分题\u201d或\u201c废话题\u201d。不要问\u201c本文讲了什么\u201d、\u201c标题是什么\u201d这种看一眼标题就能猜到的问题。
 2. 题目必须深入考察笔记中的具体概念、原理、步骤、对比或细节。
 3. 必须严格只输出一个 JSON 对象，不要输出任何解释性文字、不要使用 Markdown 代码块包裹。
 
-JSON 结构如下：
+JSON 结构如下（单选题示例）：
 {{
   "questions": [
     {{
@@ -394,34 +497,57 @@ JSON 结构如下：
   ]
 }}
 
+如果是多选题，answer_index 必须是数组，例如：
+{{
+  "questions": [
+    {{
+      "question": "以下哪些说法是正确的？（多选）",
+      "options": ["选项A文本", "选项B文本", "选项C文本", "选项D文本"],
+      "answer_index": [0, 2],
+      "explanation": "解析文本",
+      "knowledge_point": "知识点标签"
+    }}
+  ]
+}}
+
 其他要求：
 - questions 数组必须恰好包含 3 个元素。
 - **options 必须是一个包含 4 个字符串的 JSON 数组**，不要返回一整个长字符串！
-- answer_index 是 0 到 3 之间的整数，指向的是**符合题目要求的正确选项**。
-  - 如果题目问"以下哪个是正确的？"，answer_index 指向那个正确的选项。
-  - 如果题目问"以下哪个是不正确的？"或"哪一项是错误的？"，answer_index 必须指向那个**不正确/错误**的选项（因为那才是本题的正确答案）。
-  - 如果题目问"以下哪个不是...的条件？"，answer_index 指向那个**不是**该条件的选项。
-  - 总之：answer_index 永远指向"考生应该选的那个选项"，即符合题干设问方向的选项。
+- **单选题**：answer_index 是 0 到 3 之间的整数，指向符合题目要求的正确选项。
+- **多选题**：answer_index 是一个包含 2~3 个整数的数组（如 [0, 2]），指向所有正确选项。多选题必须有 2~3 个正确答案，不能只有 1 个或 4 个全选。
+- answer_index 永远指向"考生应该选的那个/那些选项"，即符合题干设问方向的选项。
+- ⚠️ **否定设问特别注意**：如果题目问"以下哪些**不是**..."或"以下哪个**不正确**"，answer_index 必须指向那些**不符合/不正确**的选项。例如：题目问"以下哪些不是细胞膜的组成部分？"，选项有 A.脂质双层 B.蛋白质 C.糖脂 D.DNA，则 answer_index 应该是 [3]（只有 DNA 不是），而不是把脂质双层也选上。请仔细核对每个被选中的选项是否真的符合题干的否定要求。
 - 题目必须基于笔记内容，不要编造笔记中不存在的信息。
 - knowledge_point 字段请从笔记中提取核心知识点，用简短的中文标签表示。
 """
 
 
-def build_system_prompt(subject: str, grade: str) -> str:
-    return SYSTEM_PROMPT_TEMPLATE.format(subject=subject or "未指定", grade=grade or "未指定")
+def build_system_prompt(subject: str, grade: str, question_type: str = "单选题") -> str:
+    qt_desc = "单项选择题" if question_type == "单选题" else "多项选择题"
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        subject=subject or "未指定",
+        grade=grade or "未指定",
+        question_type=question_type,
+        question_type_desc=qt_desc,
+    )
 
 
-def build_user_prompt(note: str, subject: str, grade: str) -> str:
+def build_user_prompt(note: str, subject: str, grade: str, question_type: str = "单选题") -> str:
     if subject == "英语":
-        lang_req = "题干和选项以英文为主，可用括号附加中文释义辅助理解。解析（explanation）必须使用纯英文，不要混入中文。"
+        lang_req = "题干和选项以英文为主，可用括号附加中文释义辅助理解。解析（explanation）必须全部使用中文撰写，不要使用英文！"
     else:
         lang_req = "请使用中文生成题干、选项和解析。"
+    qt_desc = "单项选择题" if question_type == "单选题" else "多项选择题"
+    multi_hint = ""
+    if question_type == "多选题":
+        multi_hint = "每道题必须有 2~3 个正确答案，answer_index 必须是数组（如 [0, 2]）。题干中要标注（多选）。"
     return (
-        f"学科：{subject}\n年级：{grade}\n\n"
+        f"学科：{subject}\n年级：{grade}\n题型：{question_type}\n\n"
         f"以下是课程笔记内容：\n\n---\n{note}\n---\n\n"
-        f"请据此生成 3 道单项选择题，并以规定的 JSON 格式返回。"
+        f"请据此生成 3 道{qt_desc}，并以规定的 JSON 格式返回。"
         f"注意：{lang_req}"
-        f"3 道题必须考察不同知识点，设问角度要有差异（概念题/计算题/判断题各一道为佳）。"
+        f"{multi_hint}"
+        f"3 道题必须考察不同知识点，设问角度要有差异。"
         f"选项之间要有足够区分度，不能只是改个数字或加个副词。"
         f"题干严禁包含答案内容。"
         f"数学公式请用标准文本表达（如 lim(x->0)），不要使用带反斜杠的 LaTeX。"
@@ -476,7 +602,18 @@ def _normalize_options(options, labels=("A", "B", "C", "D")):
     return [f"{labels[i]}. {normalized[i]}" for i in range(4)]
 
 
-def _coerce_answer_index(answer_index, options_count=4) -> int:
+def _coerce_answer_index(answer_index, options_count=4):
+    """将 answer_index 规范化为 int（单选）或 sorted list[int]（多选）"""
+    if isinstance(answer_index, (list, tuple)):
+        # 多选题：过滤有效索引并排序
+        valid = sorted(set(
+            int(i) for i in answer_index
+            if isinstance(i, (int, float)) and 0 <= int(i) < options_count
+        ))
+        if not valid:
+            return [0]
+        return valid
+    # 单选题
     try:
         idx = int(answer_index)
     except (TypeError, ValueError):
@@ -514,7 +651,7 @@ def _normalize_question_keys(data: dict) -> dict:
     return normalized
 
 
-def validate_questions(data: dict) -> list:
+def validate_questions(data: dict, question_type: str = "单选题") -> list:
     if not isinstance(data, dict):
         raise ValueError("模型返回的 JSON 顶层不是对象。")
     data = _normalize_question_keys(data)
@@ -527,6 +664,8 @@ def validate_questions(data: dict) -> list:
         else:
             raise ValueError(f"返回的题目数量为 {len(questions)}，不是 3 道。")
 
+    is_multi = (question_type == "多选题")
+
     cleaned = []
     for i, q in enumerate(questions, start=1):
         if not isinstance(q, dict):
@@ -536,7 +675,32 @@ def validate_questions(data: dict) -> list:
             raise ValueError(f"第 {i} 题缺少题干。")
 
         options = _normalize_options(q.get("options"))
-        answer_index = _coerce_answer_index(q.get("answer_index"), len(options))
+        raw_answer = q.get("answer_index")
+
+        # 根据用户选择的题型强制规范 answer_index 格式
+        if is_multi:
+            # 多选题：确保 answer_index 是 list
+            if not isinstance(raw_answer, (list, tuple)):
+                # 模型返回了单个整数，包装成列表（虽然不理想，但兼容）
+                raw_answer = [raw_answer] if raw_answer is not None else [0]
+            answer_index = _coerce_answer_index(raw_answer, len(options))
+            # 确保多选题至少有 2 个答案
+            if isinstance(answer_index, list) and len(answer_index) < 2:
+                # 补充一个不同的索引
+                for candidate in range(len(options)):
+                    if candidate not in answer_index:
+                        answer_index = sorted(answer_index + [candidate])
+                        break
+        else:
+            # 单选题：确保 answer_index 是 int
+            if isinstance(raw_answer, (list, tuple)):
+                # 模型返回了数组，取第一个元素
+                raw_answer = raw_answer[0] if raw_answer else 0
+            answer_index = _coerce_answer_index(raw_answer, len(options))
+            # 确保结果是 int 而不是 list
+            if isinstance(answer_index, list):
+                answer_index = answer_index[0] if answer_index else 0
+
         explanation = str(q.get("explanation", "") or "").strip()
         knowledge_point = str(q.get("knowledge_point", "") or "").strip() or "未分类"
 
@@ -550,23 +714,28 @@ def validate_questions(data: dict) -> list:
     return cleaned
 
 
-def _check_answer_leaked(question_text: str, options: list, answer_index: int) -> bool:
-    """检查题干是否泄露了正确答案的关键内容"""
-    if not question_text or not options or answer_index < 0 or answer_index >= len(options):
+def _check_answer_leaked(question_text: str, options: list, answer_index) -> bool:
+    """检查题干是否泄露了正确答案的关键内容（支持单选和多选）"""
+    if not question_text or not options:
         return False
-    correct_opt = options[answer_index]
-    # 去掉选项前缀（如 "A. ", "B. "）
-    clean_correct = re.sub(r'^[A-D]\.\s*', '', correct_opt).strip()
-    if not clean_correct or len(clean_correct) < 2:
-        return False
-    # 如果正确答案的核心内容（>=4字符）完整出现在题干中，视为泄露
-    if len(clean_correct) >= 4 and clean_correct in question_text:
-        return True
-    # 对于较短的答案，检查去除空格后是否匹配
-    q_nospace = re.sub(r'\s+', '', question_text)
-    c_nospace = re.sub(r'\s+', '', clean_correct)
-    if len(c_nospace) >= 4 and c_nospace in q_nospace:
-        return True
+    # 统一为列表处理
+    if isinstance(answer_index, (list, tuple)):
+        indices = answer_index
+    else:
+        indices = [answer_index]
+    for idx in indices:
+        if not isinstance(idx, int) or idx < 0 or idx >= len(options):
+            continue
+        correct_opt = options[idx]
+        clean_correct = re.sub(r'^[A-D]\.\s*', '', correct_opt).strip()
+        if not clean_correct or len(clean_correct) < 2:
+            continue
+        if len(clean_correct) >= 4 and clean_correct in question_text:
+            return True
+        q_nospace = re.sub(r'\s+', '', question_text)
+        c_nospace = re.sub(r'\s+', '', clean_correct)
+        if len(c_nospace) >= 4 and c_nospace in q_nospace:
+            return True
     return False
 
 
@@ -589,7 +758,7 @@ def _has_critical_defect(questions: list) -> bool:
     return False
 
 
-def generate_questions(note: str, subject: str, grade: str, max_retries: int = 2) -> list:
+def generate_questions(note: str, subject: str, grade: str, question_type: str = "单选题", max_retries: int = 2) -> list:
     client = get_client()
     last_error = None
     
@@ -598,14 +767,14 @@ def generate_questions(note: str, subject: str, grade: str, max_retries: int = 2
             response = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[
-                    {"role": "system", "content": build_system_prompt(subject, grade)},
-                    {"role": "user", "content": build_user_prompt(note, subject, grade)},
+                    {"role": "system", "content": build_system_prompt(subject, grade, question_type)},
+                    {"role": "user", "content": build_user_prompt(note, subject, grade, question_type)},
                 ],
                 temperature=0.3 if attempt == 0 else 0.5,
             )
             resp_content = response.choices[0].message.content or ""
             data = extract_json(resp_content)
-            questions = validate_questions(data)
+            questions = validate_questions(data, question_type)
             
             if _has_critical_defect(questions) and attempt < max_retries:
                 for q in questions:
@@ -639,18 +808,22 @@ def generate_questions(note: str, subject: str, grade: str, max_retries: int = 2
 
 # ============ 页面 ============
 st.title("AI课程笔记自测")
-st.caption("粘贴课程笔记，自动生成 3 道单项选择题，边学边测。")
+st.caption("粘贴课程笔记，自动生成 3 道自测题（支持单选/多选），边学边测。")
 
 init_db()
 
 SUBJECTS = ["数学", "生物", "计算机", "物理", "化学", "英语", "历史", "其他"]
 GRADES = ["大一", "大二", "大三", "大四", "研一", "研二", "高中", "初中", "其他"]
 
-col1, col2 = st.columns(2)
+QUESTION_TYPES = ["单选题", "多选题"]
+
+col1, col2, col3 = st.columns(3)
 with col1:
     subject = st.selectbox("学科", SUBJECTS, index=0)
 with col2:
     grade = st.selectbox("年级", GRADES, index=0)
+with col3:
+    question_type = st.selectbox("题型", QUESTION_TYPES, index=0)
 
 note = st.text_area(
     "课程笔记",
@@ -667,11 +840,13 @@ if st.button("生成题目", type="primary", use_container_width=True):
     else:
         with st.spinner("正在根据笔记生成题目……"):
             try:
-                questions = generate_questions(note_clean, subject, grade)
+                questions = generate_questions(note_clean, subject, grade, question_type)
                 st.session_state["questions"] = questions
                 st.session_state["submitted"] = False
+                st.session_state["is_review_mode"] = False
                 st.session_state["subject"] = subject
                 st.session_state["grade"] = grade
+                st.session_state["question_type"] = question_type
                 st.session_state["note"] = note_clean
                 st.success("题目生成成功，请作答。")
             except Exception as exc:
@@ -682,12 +857,23 @@ if st.button("生成题目", type="primary", use_container_width=True):
 questions = st.session_state.get("questions")
 if questions:
     st.divider()
-    st.subheader("自测题目")
+    is_review = st.session_state.get("is_review_mode", False)
+    review_qs = st.session_state.get("questions", [])
+    if is_review and len(review_qs) == 1:
+        st.subheader("【单题针对性重练】")
+        st.caption("🎯 针对这道错题进行专项复习，答对后可选择移出错题本。")
+    elif is_review:
+        st.subheader("【错题重练模式】")
+        st.caption("📖 以下题目来自你的错题本，答对后可选择移出错题本。")
+    else:
+        st.subheader("自测题目")
     cur_subject = st.session_state.get("subject", subject)
     cur_grade = st.session_state.get("grade", grade)
-    st.caption(f"学科：{cur_subject} ｜ 年级：{cur_grade}")
+    cur_qtype = st.session_state.get("question_type", "单选题")
+    st.caption(f"学科：{cur_subject} ｜ 年级：{cur_grade} ｜ 题型：{cur_qtype}")
 
     user_answers = []
+    cur_qtype = st.session_state.get("question_type", "单选题")
     for idx, q in enumerate(questions, start=1):
         st.markdown(f"**第 {idx} 题：{q['question']}**")
         
@@ -697,16 +883,36 @@ if questions:
             
         q["answer_index"] = _coerce_answer_index(q.get("answer_index"), len(opts))
         q["options"] = opts
+        # 以用户选择的题型为准，而不是模型返回的数据格式
+        is_multi = (cur_qtype == "多选题")
+        # 二次保险：确保数据格式与题型一致
+        if is_multi and not isinstance(q["answer_index"], list):
+            q["answer_index"] = [q["answer_index"]]
+        elif not is_multi and isinstance(q["answer_index"], list):
+            q["answer_index"] = q["answer_index"][0] if q["answer_index"] else 0
 
-        choice = st.radio(
-            label=f"第 {idx} 题选项",
-            options=list(range(len(opts))),
-            index=0,
-            format_func=lambda i, o=opts: o[i],
-            key=f"q_{idx}",
-            label_visibility="collapsed",
-        )
-        user_answers.append(choice)
+        if is_multi:
+            # 多选题：使用 checkbox
+            selected = []
+            for opt_idx, opt_text in enumerate(opts):
+                checked = st.checkbox(
+                    opt_text,
+                    key=f"q_{idx}_opt_{opt_idx}",
+                )
+                if checked:
+                    selected.append(opt_idx)
+            user_answers.append(selected)
+        else:
+            # 单选题：使用 radio
+            choice = st.radio(
+                label=f"第 {idx} 题选项",
+                options=list(range(len(opts))),
+                index=0,
+                format_func=lambda i, o=opts: o[i],
+                key=f"q_{idx}",
+                label_visibility="collapsed",
+            )
+            user_answers.append(choice)
 
     if st.button("提交答案", type="secondary", use_container_width=True):
         st.session_state["submitted"] = True
@@ -716,26 +922,54 @@ if questions:
         score = 0
         for idx, (q, ans) in enumerate(zip(questions, user_answers), start=1):
             correct = _coerce_answer_index(q.get("answer_index"), len(q["options"]))
-            ans = ans if isinstance(ans, int) and 0 <= ans < len(q["options"]) else 0
-            is_right = ans == correct
+            is_multi = isinstance(correct, list)
+
+            if is_multi:
+                # 多选题判分：用户选中的索引集合必须与正确答案集合完全一致
+                user_set = set(ans) if isinstance(ans, list) else set()
+                correct_set = set(correct)
+                is_right = user_set == correct_set
+                user_display = "、".join(q["options"][i] for i in sorted(user_set)) if user_set else "未选择"
+                correct_display = "、".join(q["options"][i] for i in sorted(correct_set))
+            else:
+                # 单选题判分
+                ans = ans if isinstance(ans, int) and 0 <= ans < len(q["options"]) else 0
+                is_right = ans == correct
+                user_display = q["options"][ans]
+                correct_display = q["options"][correct]
+
+            is_review = st.session_state.get("is_review_mode", False)
+
             if is_right:
                 score += 1
             else:
-                save_wrong_question(
-                    question=q["question"],
-                    options=q["options"],
-                    answer_index=correct,
-                    explanation=q.get("explanation", ""),
-                    knowledge_point=q.get("knowledge_point", "未分类"),
-                    subject=cur_subject,
-                    grade=cur_grade,
-                )
+                # 非重练模式下，答错才存入错题本；重练模式下不重复存入
+                if not is_review:
+                    save_wrong_question(
+                        question=q["question"],
+                        options=q["options"],
+                        answer_index=correct,
+                        explanation=q.get("explanation", ""),
+                        knowledge_point=q.get("knowledge_point", "未分类"),
+                        subject=cur_subject,
+                        grade=cur_grade,
+                    )
 
             st.markdown(f"### 第 {idx} 题 {'✅ 正确' if is_right else '❌ 错误'}")
-            st.markdown(f"- 你的答案：{q['options'][ans]}")
-            st.markdown(f"- 正确答案：{q['options'][correct]}")
+            st.markdown(f"- 你的答案：{user_display}")
+            st.markdown(f"- 正确答案：{correct_display}")
             if q.get("explanation"):
                 st.markdown(f"- 解析：{q['explanation']}")
+
+            # 重练模式下，答对的题显示"已掌握"按钮
+            if is_review and is_right:
+                master_key = f"master_q_{idx}"
+                if st.button("🗑️ 我已完全掌握，移出错题本", key=master_key):
+                    if delete_wrong_question(q["question"]):
+                        st.success(f"已将「{q['question'][:30]}...」移出错题本 🎉")
+                        st.rerun()
+                    else:
+                        st.error("移除失败，请重试。")
 
         st.info(f"得分：{score} / {len(questions)}")
 
@@ -746,12 +980,14 @@ if questions:
                 saved_note = st.session_state.get("note", "")
                 saved_subject = st.session_state.get("subject", subject)
                 saved_grade = st.session_state.get("grade", grade)
+                saved_qtype = st.session_state.get("question_type", "单选题")
                 if saved_note:
                     with st.spinner("正在重新生成题目……"):
                         try:
-                            new_questions = generate_questions(saved_note, saved_subject, saved_grade)
+                            new_questions = generate_questions(saved_note, saved_subject, saved_grade, saved_qtype)
                             st.session_state["questions"] = new_questions
                             st.session_state["submitted"] = False
+                            st.session_state["is_review_mode"] = False
                             # 清除旧的 radio 选择状态
                             for k in list(st.session_state.keys()):
                                 if k.startswith("q_"):
@@ -767,6 +1003,7 @@ if questions:
                 st.session_state.pop("questions", None)
                 st.session_state.pop("submitted", None)
                 st.session_state.pop("note", None)
+                st.session_state["is_review_mode"] = False
                 for k in list(st.session_state.keys()):
                     if k.startswith("q_"):
                         del st.session_state[k]
@@ -882,6 +1119,49 @@ with st.sidebar:
         else:
             total_wrong = sum(len(qs) for kps in grouped.values() for qs in kps.values())
             st.markdown(f"**共 {total_wrong} 道错题**")
+
+            # ---- 重新练习错题按钮 ----
+            if st.button("🔄 重新练习错题", type="primary", use_container_width=True, key="review_btn"):
+                review_questions = get_random_wrong_questions(5)
+                if review_questions:
+                    st.session_state["questions"] = review_questions
+                    st.session_state["submitted"] = False
+                    st.session_state["is_review_mode"] = True
+                    # 根据第一题的 answer_index 类型推断题型
+                    first_ans = review_questions[0].get("answer_index", 0)
+                    st.session_state["question_type"] = "多选题" if isinstance(first_ans, list) else "单选题"
+                    st.session_state["subject"] = review_questions[0].get("subject", "未分类")
+                    st.session_state["grade"] = review_questions[0].get("grade", "未分类")
+                    # 清除旧的答题状态
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("q_"):
+                            del st.session_state[k]
+                    st.rerun()
+                else:
+                    st.warning("错题本为空，无法重练。")
+
+            # ---- 清空所有错题按钮（带确认） ----
+            if "confirm_clear_all" not in st.session_state:
+                st.session_state["confirm_clear_all"] = False
+
+            if not st.session_state["confirm_clear_all"]:
+                if st.button("🗑️ 清空所有错题", type="secondary", key="clear_all_btn"):
+                    st.session_state["confirm_clear_all"] = True
+                    st.rerun()
+            else:
+                st.warning("⚠️ 确定要清空所有错题吗？此操作不可恢复！")
+                confirm_col1, confirm_col2 = st.columns(2)
+                with confirm_col1:
+                    if st.button("✅ 确认清空", type="primary", key="confirm_clear_yes"):
+                        deleted_count = delete_all_wrong_questions()
+                        st.session_state["confirm_clear_all"] = False
+                        st.success(f"已清空 {deleted_count} 道错题。")
+                        st.rerun()
+                with confirm_col2:
+                    if st.button("❌ 取消", key="confirm_clear_no"):
+                        st.session_state["confirm_clear_all"] = False
+                        st.rerun()
+
             st.divider()
 
             for subj, kp_map in grouped.items():
@@ -891,11 +1171,44 @@ with st.sidebar:
                         with st.expander(f"📌 {kp}（{len(qs)}题）", expanded=False):
                             for q_idx, q in enumerate(qs, 1):
                                 st.markdown(f"**{q_idx}. {q['question']}**")
+                                ans_idx = q.get("answer_index", 0)
+                                ans_set = set(ans_idx) if isinstance(ans_idx, list) else {ans_idx}
                                 for opt_idx, opt in enumerate(q.get("options", [])):
-                                    prefix = "✅" if opt_idx == q.get("answer_index") else "○"
+                                    prefix = "✅" if opt_idx in ans_set else "○"
                                     st.markdown(f"{prefix} {opt}")
                                 if q.get("explanation"):
                                     st.markdown(f"*解析：{q['explanation']}*")
                                 st.markdown(f"*年级：{q.get('grade', '未分类')}*")
                                 st.markdown(f"*做错时间：{q['created_at']}*")
+                                # ---- 操作按钮 ----
+                                btn_a, btn_b = st.columns(2)
+                                with btn_a:
+                                    review_key = f"review_single_{hash(q['question']) % 100000}_{q_idx}"
+                                    if st.button("✏️ 单独重练此题", key=review_key):
+                                        single_q = {
+                                            "question": q["question"],
+                                            "options": q.get("options", []),
+                                            "answer_index": q.get("answer_index", 0),
+                                            "explanation": q.get("explanation", ""),
+                                            "knowledge_point": q.get("knowledge_point", "未分类"),
+                                        }
+                                        st.session_state["questions"] = [single_q]
+                                        st.session_state["submitted"] = False
+                                        st.session_state["is_review_mode"] = True
+                                        ans = single_q.get("answer_index", 0)
+                                        st.session_state["question_type"] = "多选题" if isinstance(ans, list) else "单选题"
+                                        st.session_state["subject"] = subj
+                                        st.session_state["grade"] = q.get("grade", "未分类")
+                                        for k in list(st.session_state.keys()):
+                                            if k.startswith("q_"):
+                                                del st.session_state[k]
+                                        st.rerun()
+                                with btn_b:
+                                    del_key = f"del_q_{subj}_{kp}_{q_idx}"
+                                    if st.button("🗑️ 删除本题", key=del_key):
+                                        if delete_wrong_question(q["question"]):
+                                            st.success("已删除该题。")
+                                            st.rerun()
+                                        else:
+                                            st.error("删除失败，请重试。")
                                 st.divider()
